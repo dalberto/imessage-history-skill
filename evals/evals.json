@@ -1,0 +1,38 @@
+{
+  "skill_name": "imessage-history",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Characterize the vibe of my group chat with substring <GROUP_NAME>. Give me the top themes, the dynamic between participants, and 3-5 representative verbatim quotes with timestamps and senders.",
+      "expected_output": "A concise characterization with verbatim-quoted evidence. The skill should run chats/stats/participants to ground the summary, then use anchor-sweep or window to pull reply-chain context before quoting.",
+      "expectations": [
+        "The skill resolved the chat by name and picked the chat_id with the highest message count",
+        "The skill ran stats or participants to size up the chat before summarizing",
+        "Every quoted message includes a timestamp and sender",
+        "The skill pulled reply-chain context (via anchor-sweep or window) rather than citing bare keyword hits",
+        "The summary reports the actual date range the data covers, not the range the user asked about"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Find the first time <CONTACT_NAME> mentioned <TOPIC> in any conversation with me, and pull the 30 minutes of messages around that anchor so I can see the context.",
+      "expected_output": "A single anchor message with its reply chain. The skill should run a global keyword search (no --chat-id), pick the earliest match, then window around it.",
+      "expectations": [
+        "The skill searched across all chats, not just one",
+        "The skill identified the earliest matching message and cited its timestamp",
+        "The skill pulled a window of surrounding messages around the anchor",
+        "Every quoted message includes a timestamp and sender"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Who are the people I have the most active Messages conversations with over the last 90 days? Unify any contacts that show up under split phone/email handles.",
+      "expected_output": "A ranked list of chats by message count over the window, with split-handle chats unified via participant name resolution.",
+      "expectations": [
+        "The skill used a date-windowed chats query (--since) rather than all-time counts",
+        "The skill used --participant or stats to unify split phone/email chats",
+        "The response ranks results by message count"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+[
+  {
+    "query": "summarize what we talked about in the family group chat over the last month",
+    "should_trigger": true
+  },
+  {
+    "query": "when did my friend first mention the Costa Rica trip?",
+    "should_trigger": true
+  },
+  {
+    "query": "pull up the imessage where we agreed on the rent number",
+    "should_trigger": true
+  },
+  {
+    "query": "who's in my messages group chat called work-buddies",
+    "should_trigger": true
+  },
+  {
+    "query": "I need to cite something my sister said in Messages about the house",
+    "should_trigger": true
+  },
+  {
+    "query": "how active has my chat with mom been this year compared to last year?",
+    "should_trigger": true
+  },
+  {
+    "query": "characterize that group chat I have with my college friends — what's the vibe, who drives it?",
+    "should_trigger": true
+  },
+  {
+    "query": "show me the texts between me and Sarah from the week we were negotiating the offer",
+    "should_trigger": true
+  },
+  {
+    "query": "get the context around the message I sent on March 5 at 2pm about the car",
+    "should_trigger": true
+  },
+  {
+    "query": "list every group chat I'm in with more than 5000 messages",
+    "should_trigger": true
+  },
+  {
+    "query": "search Slack for the thread about the Q4 roadmap",
+    "should_trigger": false
+  },
+  {
+    "query": "find the email HR sent about the new PTO policy",
+    "should_trigger": false
+  },
+  {
+    "query": "look through my Discord DMs for the conversation about the art commission",
+    "should_trigger": false
+  },
+  {
+    "query": "write me a Python script that connects to chat.db and prints the last 10 messages",
+    "should_trigger": false
+  },
+  {
+    "query": "can you send my partner a text asking what time dinner is?",
+    "should_trigger": false
+  },
+  {
+    "query": "search my Notes app for the recipe I saved last fall",
+    "should_trigger": false
+  },
+  {
+    "query": "find the WhatsApp message where we coordinated the airport pickup",
+    "should_trigger": false
+  },
+  {
+    "query": "dump my contacts to a CSV",
+    "should_trigger": false
+  },
+  {
+    "query": "restore my iMessage history from an iCloud backup I made last year",
+    "should_trigger": false
+  },
+  {
+    "query": "transcribe the voice memos in my last Signal conversation",
+    "should_trigger": false
+  }
+]
