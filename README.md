@@ -16,6 +16,10 @@ mixed together. Useful for:
 - **Audit.** "Every photo shared in the family chat last summer."
 - **Rhythm.** "How often do I text my partner? When was our longest
   quiet stretch?"
+- **Dashboards.** "Build me a dashboard of my texting patterns with my
+  brother" — a self-contained HTML page of response times, who texts
+  first, streaks, and volume over time. Quantitative dashboards include
+  no message content; an optional narrative mode adds quoted highlights.
 
 The Mac Messages app shows you one chat at a time and stops scrolling
 after a few months. This skill searches the underlying database
@@ -59,6 +63,10 @@ your machine.
 - **Custom contact names are gitignored.** If you create
   `contacts.json` to rename a handle, it's excluded from version
   control by default.
+- **Generated dashboards are gitignored.** Quantitative dashboards are
+  content-free, but narrative dashboards embed quoted messages, so
+  `*.html` output is excluded from version control by default. Share
+  generated files intentionally.
 
 You'll need to grant **Full Disk Access** to whatever process runs
 the script (Terminal, iTerm, Ghostty, VS Code, etc.) because
@@ -137,7 +145,10 @@ override file.
 ## Under the hood
 
 The AI agent is just a friendly front-end. Underneath, this skill is
-a single stdlib Python script that you can also run directly:
+a stdlib Python script (`scripts/imessage.py`, plus a sibling
+`scripts/dashboard.py` and an editable HTML/CSS shell at
+`templates/dashboard.html`, used only for rendering dashboards) that you
+can also run directly:
 
 ```fish
 # Find the family group chat
@@ -162,6 +173,9 @@ python3 scripts/imessage.py attachments 42 --mime-like image --since 2025-06-01
 
 # That address Alex sent a while back, as JSON for piping
 python3 scripts/imessage.py search -k "Bedford" --from "Alex Example" --format ndjson
+
+# Build a dashboard of my texting patterns with Alex (1:1 chat)
+python3 scripts/imessage.py dashboard 42 --theme light --out alex.html
 ```
 
 Phone numbers and emails are resolved to the names in your macOS
@@ -184,6 +198,8 @@ list.
 | `anchor-sweep` | Keyword search then auto-window and merge, returning contiguous passages with anchors marked. |
 | `attachments` | List attachments in a chat over a range. |
 | `reactions` | Surface tapbacks (normally filtered) with their target messages. |
+| `metrics` | 1:1 relationship metrics (response time, share, who-restarts, double-texting, streak, monthly volume) as JSON. Content-free. |
+| `dashboard` | Render a self-contained HTML dashboard for a 1:1 chat. `--theme light/dark`, `--out`, `--modules`, and `--annotations` for an optional narrative layer. |
 
 ### Why this needs to be a script
 

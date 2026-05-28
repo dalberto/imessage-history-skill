@@ -66,7 +66,9 @@ characterize something from their own Messages history:
 
 ## The tool
 
-One Python script: `scripts/imessage.py`. Invoke with:
+One Python script: `scripts/imessage.py` (the `dashboard` subcommand also
+uses a sibling `scripts/dashboard.py` for rendering, and the HTML/CSS shell
+lives in `templates/dashboard.html` — all stdlib, no install). Invoke with:
 
 ```fish
 python3 <skill>/scripts/imessage.py <subcommand> [opts]
@@ -86,6 +88,8 @@ Use `ndjson` when piping into other tools.
 | `anchor-sweep <chat_id> -k KEYWORD` | Runs a keyword search, then auto-pulls a window around every hit and merges overlapping windows into contiguous passages. Anchors are marked with ⚓. This is the single highest-leverage move for reply-chain research — replaces the manual search-then-window loop. |
 | `attachments <chat_id>` | List attachments (filename, mime type, size, sender) over a date range. `--mime-like` filters by mime type substring. |
 | `reactions <chat_id>` | Surface tapbacks (normally filtered) with their target messages. Useful for "how did the chat respond to X" without reading prose. |
+| `metrics <chat_id>` | Compute a menu of **1:1** relationship metrics (response time, message share, who-restarts-after-silence, double-texting, streak, monthly volume, …) as JSON or a text summary. `--modules a,b,c` selects a subset (default all). Content-free. |
+| `dashboard <chat_id>` | Render a **self-contained HTML dashboard** for a 1:1 chat from the metric menu. `--theme light\|dark`, `--out PATH` (default stdout), `--modules`, and `--annotations notes.json` to merge a model-authored narrative layer (themes, quotes, arc). |
 
 Pass `--help` on any subcommand for its full flag list.
 
@@ -194,6 +198,118 @@ python3 <skill>/scripts/imessage.py reactions <chat_id> --since <date>
 Tapbacks are a compact signal for how the chat reacted to specific
 messages. Pull reactions over a date range when you want to gauge
 response without reading the full prose.
+
+## Dashboards (1:1)
+
+`metrics` and `dashboard` turn a **one-on-one** thread into a relationship
+analysis. `metrics` emits the numbers as JSON; `dashboard` renders a
+self-contained HTML page (inline CSS + SVG, no external deps, opens
+offline). They share one **module menu** — pick the modules that make an
+interesting picture of the relationship.
+
+Two archetypes, one renderer:
+
+- **Quantitative** (`--theme light`, no annotations): a content-free
+  one-pager — KPIs, response times, share, who-restarts, streaks, volume.
+  The footer truthfully states no message content is included.
+- **Narrative** (`--theme dark --annotations notes.json`): the same charts
+  plus a model-authored layer of themes, quotes, and a narrative arc — a
+  "conversation field report."
+
+**1:1 only.** Response time, who-restarts, and double-texting are pairwise.
+If a chat has more than one other participant the command refuses and points
+you at `chats --participant "<name>"`. Two handles (phone + email) that
+resolve to the same name are treated as one person.
+
+### Module menu
+
+| Module | What it shows |
+| --- | --- |
+| `kpis` | 4-up headline strip: volume ratio, the other person's median + 80th-pct reply wait, current streak |
+| `message_share` | Volume donut + your/their split and ratio |
+| `response_time` | The other person's reply-latency histogram (`<5m … 7d+`) with median/p80 |
+| `who_restarts` | Who sends the first message after a silence, by gap threshold (8h/12h/24h/48h/72h), cumulative |
+| `texts_before_reply` | How many texts in a row you send before they reply (1/2/3/4/5+) |
+| `monthly_volume` | Per-month grouped bars, you vs them |
+| `weekday` / `hour` | Activity rhythm |
+| `top_days` | Most active days |
+| `longest_gap` | Longest dormancy and when it broke |
+| `streak` | Current unbroken-contact span (no gap > 24h; tune with `--streak-silence-h`) |
+
+**How the turn metrics are defined.** A *burst* is a run of consecutive
+messages from the same person. **Response time** = the wait from the *first*
+text of your burst to their first reply (so a long monologue counts against
+their measured wait). **who_restarts** counts each silence in every threshold
+it exceeds, so the bars shrink monotonically. **streak** is now-anchored when
+the thread is still active, so it grows in real time. All modules are
+content-free — they use only timestamps, senders, and message lengths.
+
+**Delivering the dashboard.** Always write to a file with `--out`, then
+**open it in the user's default browser** so they see it rendered — on macOS:
+`open <path>`. The dashboard is a thing to *view*, not a file to hand over:
+do **not** attach/send the raw `.html`, paste its markup into chat, or just
+print the path and stop. Render → open → tell the user it's open (and where
+the file is).
+
+### Recipe A — quantitative one-pager
+
+```fish
+python3 <skill>/scripts/imessage.py chats --participant "<name>"   # find the 1:1 chat_id
+python3 <skill>/scripts/imessage.py dashboard <chat_id> --theme light --out ~/Desktop/<name>-imessage.html
+open ~/Desktop/<name>-imessage.html
+```
+
+Add `--modules kpis,response_time,who_restarts,monthly_volume` to focus.
+Nothing leaves the machine and no message text is embedded.
+
+### Recipe B — narrative field report
+
+```fish
+python3 <skill>/scripts/imessage.py metrics <chat_id> --format json        # read the numbers
+python3 <skill>/scripts/imessage.py anchor-sweep <chat_id> -k <topic> ...   # gather candidate quotes
+# author notes.json (schema below), then:
+python3 <skill>/scripts/imessage.py dashboard <chat_id> --theme dark \
+  --annotations notes.json --out ~/Desktop/<name>-imessage.html
+open ~/Desktop/<name>-imessage.html
+```
+
+The annotations JSON (`imessage-dashboard-annotations/v1`) is flat; every
+section is optional and unknown keys are ignored:
+
+```json
+{
+  "schema": "imessage-dashboard-annotations/v1",
+  "hero": {"eyebrow": "Field report", "title": "…", "thesis": "1–3 sentences"},
+  "at_a_glance": [{"label": "Span", "value": "…"}],
+  "shape": {"title": "…", "paragraphs": ["…"]},
+  "findings": [{"title": "…", "body": "…"}],
+  "speaker_profiles": [{"name": "…", "body": "…", "traits": ["…"]}],
+  "narrative_arc": [{"date_range": "…", "title": "…", "paragraph": "…"}],
+  "spiky_reads": [{"title": "…", "body": "…"}],
+  "themes": [{"kicker": "…", "title": "…", "paragraph": "…"}],
+  "moments": [{"title": "…", "quote": "verbatim text",
+               "citation": {"sender": "…", "ts": "YYYY-MM-DD HH:MM:SS", "rowid": 123}}],
+  "data_lenses": [{"title": "…", "body": "…", "svg_hint": "monthly_volume"}],
+  "explore_further": ["…"],
+  "final_read": {"title": "Final read", "paragraphs": ["…"]}
+}
+```
+
+Every `moments` entry must carry a `citation` (sender + timestamp; `rowid`
+optional) so quotes are verifiable. `data_lenses[].svg_hint` may name a
+quantitative module to inline its chart beneath the prose.
+
+**Customizing the look.** The entire visual shell — document skeleton, all
+CSS, and the moments-filter JS — is one external file, `templates/dashboard.html`,
+with `{{TITLE}}` / `{{THEME}}` / `{{BODY}}` placeholders. Both themes are CSS
+variables in that file; edit colors, spacing, or fonts there without touching
+Python. The rendered output stays fully self-contained (the template's CSS/JS
+are inlined).
+
+**Privacy.** The quantitative dashboard is content-free. The narrative layer
+**embeds verbatim quotes** — fact-check each `moments[].quote` against
+`window`/`search` before embedding (see Synthesis rules below), and treat the
+generated HTML as private (its footer says so).
 
 ## Contact resolution
 

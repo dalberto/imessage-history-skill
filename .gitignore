@@ -2,3 +2,8 @@ contacts.json
 __pycache__/
 *.pyc
 .DS_Store
+
+# Generated dashboards (may contain private message content)
+*.html
+!templates/dashboard.html
+dashboards/

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sqlite3
@@ -41,6 +42,7 @@ import statistics
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 DB_DEFAULT = os.path.expanduser("~/Library/Messages/chat.db")
 ADDRESSBOOK_SOURCES = os.path.expanduser(
@@ -466,6 +468,417 @@ def _emit_messages(
 
 
 # ---------------------------------------------------------------------- #
+# Metrics — 1:1 conversation analysis (powers `metrics` + `dashboard`)   #
+# ---------------------------------------------------------------------- #
+#
+# The dashboard capability is grounded in two artifacts a power user built
+# with this skill: a content-free quantitative one-pager and a richer
+# narrative "field report". Every metric below is *content-free* — it uses
+# only timestamps, senders, and message lengths, never message text. The
+# only place text enters a dashboard is the optional narrative annotations
+# layer (see scripts/dashboard.py), which the model supplies separately.
+
+MODULES = [
+    "kpis", "message_share", "response_time", "who_restarts",
+    "texts_before_reply", "monthly_volume", "weekday", "hour",
+    "top_days", "longest_gap", "streak",
+]
+
+WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# Response-time + texts-before-reply buckets. Edges are left-closed,
+# right-open seconds. Labels match the artifacts they reproduce.
+RT_BUCKETS = [
+    ("<5m", 0, 300),
+    ("5m–1h", 300, 3600),
+    ("1h–1d", 3600, 86400),
+    ("1–3d", 86400, 259200),
+    ("3–7d", 259200, 604800),
+    ("7d+", 604800, None),
+]
+TBR_BUCKETS = ["1", "2", "3", "4", "5+"]
+RESTART_THRESHOLDS_H = [8, 12, 24, 48, 72]
+
+
+class MMsg(NamedTuple):
+    """A normalized message for metric computation.
+
+    Lighter than `_row_to_record`; carries only what the metrics need.
+    `kind` is "text" when the decoded body is non-empty, else "media"
+    (attachment-only / sticker / empty). Burst & gap metrics count media
+    messages (a photo reply *is* a reply); share & length metrics use only
+    text messages so totals agree with `stats`.
+    """
+
+    ns: int            # apple nanoseconds (normalized)
+    is_me: bool
+    side: str          # "me" | "other"
+    hid: str | None    # raw handle.id of the sender (None for me)
+    kind: str          # "text" | "media"
+    text_len: int
+
+
+class Burst(NamedTuple):
+    """A maximal run of consecutive messages from the same side."""
+
+    side: str
+    start_ns: int
+    end_ns: int
+    count: int
+
+
+def _normalize_ns(date_val: int) -> int:
+    """chat.db stores nanoseconds on modern macOS but seconds on very old
+    DBs. Normalize to nanoseconds with the same digit heuristic fmt_ts uses,
+    so downstream arithmetic (gaps, latencies) is always in nanoseconds."""
+    return date_val if len(str(date_val)) > 10 else date_val * 1_000_000_000
+
+
+def load_metric_messages(con, chat_id, since, until):
+    """Return (msgs_all, msgs_content, other_handles).
+
+    msgs_all      — every message in range, date-ordered (incl. media).
+    msgs_content  — subset with non-empty decoded text.
+    other_handles — distinct raw handle.id strings for non-me senders that
+                    actually sent a message in range (feeds the 1:1 guard).
+    Reactions are already excluded by `_build_where`.
+    """
+    where, params = _build_where([chat_id], None, since, until)
+    rows = _query_messages(con, where, params)
+    msgs_all: list[MMsg] = []
+    msgs_content: list[MMsg] = []
+    other_handles: set[str] = set()
+    for _rowid, _cid, ns, is_me, hid, text, att, _amt in rows:
+        ns = _normalize_ns(ns)
+        is_me_b = bool(is_me)
+        content = get_message_text(text, att)
+        content = content.strip() if content else ""
+        m = MMsg(
+            ns=ns,
+            is_me=is_me_b,
+            side="me" if is_me_b else "other",
+            hid=hid,
+            kind="text" if content else "media",
+            text_len=len(content),
+        )
+        msgs_all.append(m)
+        if content:
+            msgs_content.append(m)
+        if not is_me_b and hid:
+            other_handles.add(hid)
+    return msgs_all, msgs_content, other_handles
+
+
+def detect_bursts(msgs: list[MMsg]) -> list[Burst]:
+    """Collapse a date-ordered message list into alternating bursts.
+
+    A burst starts whenever the sender changes; no time threshold is
+    applied (a multi-day monologue is still one burst — gap logic lives in
+    who_restarts/streak). Adjacent bursts therefore always differ in side.
+    """
+    bursts: list[Burst] = []
+    for m in msgs:
+        if bursts and bursts[-1].side == m.side:
+            b = bursts[-1]
+            bursts[-1] = b._replace(end_ns=m.ns, count=b.count + 1)
+        else:
+            bursts.append(Burst(m.side, m.ns, m.ns, 1))
+    return bursts
+
+
+def _bucket_label(secs: float) -> str:
+    for label, lo, hi in RT_BUCKETS:
+        if secs >= lo and (hi is None or secs < hi):
+            return label
+    return RT_BUCKETS[-1][0]
+
+
+def _percentile(vals: list[float], q: float):
+    """Nearest-rank percentile; q in [0,1]. Returns None for empty input."""
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return None
+    if n == 1:
+        return s[0]
+    rank = math.ceil(q * n)
+    return s[min(rank, n) - 1]
+
+
+# --- individual metric modules (all content-free) --------------------- #
+
+def message_share(msgs_content: list[MMsg]) -> dict:
+    me = sum(1 for m in msgs_content if m.side == "me")
+    other = sum(1 for m in msgs_content if m.side == "other")
+    total = me + other
+    return {
+        "total": total,
+        "me": {"count": me, "share": round(me / total, 4) if total else 0},
+        "other": {"count": other, "share": round(other / total, 4) if total else 0},
+        "ratio_me_over_other": round(me / other, 2) if other else None,
+    }
+
+
+def response_time(bursts: list[Burst]) -> dict:
+    """Reply latency = ts(first message of the responder's burst) −
+    ts(first message of the preceding burst), i.e. the wait measured from
+    the *first* text in the opener's burst. Attributed to the responder.
+    Computed for both directions; `other` is the headline (e.g. "their
+    response time")."""
+    lat: dict[str, list[float]] = {"me": [], "other": []}
+    for prev, cur in zip(bursts, bursts[1:]):
+        if prev.side == cur.side:
+            continue
+        lat[cur.side].append((cur.start_ns - prev.start_ns) / 1e9)
+    out = {}
+    for side, vals in lat.items():
+        buckets = {label: 0 for label, _, _ in RT_BUCKETS}
+        for v in vals:
+            buckets[_bucket_label(v)] += 1
+        out[side] = {
+            "buckets": buckets,
+            "median_s": statistics.median(vals) if vals else None,
+            "p80_s": _percentile(vals, 0.8),
+            "n": len(vals),
+        }
+    return out
+
+
+def who_restarts(msgs: list[MMsg]) -> dict:
+    """Who breaks a silence? For each consecutive-message gap, attribute the
+    restart to whoever sent the next message. Counts are cumulative across
+    thresholds — a 50h gap counts toward 8h/12h/24h/48h — so the bars are
+    monotone non-increasing in the threshold."""
+    counts = {f"{h}h": {"me": 0, "other": 0} for h in RESTART_THRESHOLDS_H}
+    for prev, cur in zip(msgs, msgs[1:]):
+        gap_s = (cur.ns - prev.ns) / 1e9
+        for h in RESTART_THRESHOLDS_H:
+            if gap_s >= h * 3600:
+                counts[f"{h}h"][cur.side] += 1
+    return {"thresholds": [f"{h}h" for h in RESTART_THRESHOLDS_H], "counts": counts}
+
+
+def texts_before_reply(bursts: list[Burst]) -> dict:
+    """Distribution of burst lengths that were then answered: how many texts
+    in a row a side sends before the other replies. The final burst is
+    excluded (nothing replied to it). Bucketed 1/2/3/4/5+ with a median."""
+    lengths: dict[str, list[int]] = {"me": [], "other": []}
+    for b in bursts[:-1]:
+        lengths[b.side].append(b.count)
+    out = {}
+    for side, vals in lengths.items():
+        buckets = {k: 0 for k in TBR_BUCKETS}
+        for c in vals:
+            buckets[str(c) if c < 5 else "5+"] += 1
+        out[side] = {
+            "buckets": buckets,
+            "median": statistics.median(vals) if vals else None,
+            "n": len(vals),
+        }
+    return out
+
+
+def _dense_months(first: str, last: str) -> list[str]:
+    fy, fm = (int(x) for x in first.split("-"))
+    ly, lm = (int(x) for x in last.split("-"))
+    out, y, mo = [], fy, fm
+    while (y, mo) <= (ly, lm):
+        out.append(f"{y:04d}-{mo:02d}")
+        mo += 1
+        if mo > 12:
+            mo, y = 1, y + 1
+    return out
+
+
+def monthly_volume(msgs_content: list[MMsg]) -> dict:
+    per: dict[str, list[int]] = {}
+    for m in msgs_content:
+        dt = to_datetime(m.ns)
+        if not dt:
+            continue
+        cell = per.setdefault(dt.strftime("%Y-%m"), [0, 0])
+        cell[0 if m.side == "me" else 1] += 1
+    if not per:
+        return {"months": [], "me": [], "other": []}
+    months = _dense_months(min(per), max(per))
+    return {
+        "months": months,
+        "me": [per.get(k, [0, 0])[0] for k in months],
+        "other": [per.get(k, [0, 0])[1] for k in months],
+    }
+
+
+def streak(msgs_all: list[MMsg], silence_h: float = 24.0, now_ns: int | None = None) -> dict:
+    """Current conversational streak: the span of the latest unbroken run
+    with no gap longer than `silence_h`. Now-anchored when the thread is
+    still active (so it grows in real time, yielding fractional days), else
+    reports the span of the last run with is_active=False."""
+    if not msgs_all:
+        return {
+            "days": 0.0, "start": None, "silence_threshold_h": silence_h,
+            "is_active": False, "broken": True,
+        }
+    if now_ns is None:
+        now_ns = to_apple_ns(datetime.now())
+    now_ns = _normalize_ns(now_ns)
+    silence_ns = silence_h * 3600 * 1e9
+    run_start = msgs_all[0].ns
+    for prev, cur in zip(msgs_all, msgs_all[1:]):
+        if (cur.ns - prev.ns) > silence_ns:
+            run_start = cur.ns  # last break wins → start of the final run
+    last_ns = msgs_all[-1].ns
+    is_active = (now_ns - last_ns) <= silence_ns
+    end_ref = now_ns if is_active else last_ns
+    return {
+        "days": round((end_ref - run_start) / 1e9 / 86400, 1),
+        "start": fmt_ts(run_start),
+        "silence_threshold_h": silence_h,
+        "is_active": is_active,
+        "broken": not is_active,
+    }
+
+
+# --- shared aggregations (also used by cmd_stats) --------------------- #
+
+def weekday_hour_histograms(ns_list: list[int]) -> tuple[dict, dict]:
+    weekday = [0] * 7
+    hour = [0] * 24
+    for ns in ns_list:
+        dt = to_datetime(ns)
+        if dt:
+            weekday[dt.weekday()] += 1
+            hour[dt.hour] += 1
+    return (
+        dict(zip(WEEKDAY_LABELS, weekday)),
+        {str(h): hour[h] for h in range(24)},
+    )
+
+
+def top_days(ns_list: list[int], k: int = 5) -> list[dict]:
+    day_counts: dict[str, int] = {}
+    for ns in ns_list:
+        dt = to_datetime(ns)
+        if dt:
+            key = dt.strftime("%Y-%m-%d")
+            day_counts[key] = day_counts.get(key, 0) + 1
+    top = sorted(day_counts.items(), key=lambda kv: -kv[1])[:k]
+    return [{"date": d, "count": c} for d, c in top]
+
+
+def longest_gap(ns_list: list[int]) -> dict:
+    longest = 0.0
+    gstart = gend = None
+    for prev, cur in zip(ns_list, ns_list[1:]):
+        delta = (cur - prev) / 1e9 / 86400
+        if delta > longest:
+            longest, gstart, gend = delta, prev, cur
+    return {"days": round(longest, 2), "from": fmt_ts(gstart), "to": fmt_ts(gend)}
+
+
+def compute_kpis(share: dict, rt: dict, strk: dict, labels: dict) -> dict:
+    """Derived 4-up summary: volume ratio, the other side's median + p80
+    reply wait, and the current streak."""
+    rt_other = rt.get("other", {})
+    return {
+        "other_label": labels.get("other", "Them"),
+        "ratio": share.get("ratio_me_over_other"),
+        "median_s": rt_other.get("median_s"),
+        "p80_s": rt_other.get("p80_s"),
+        "streak_days": strk.get("days"),
+        "streak_active": strk.get("is_active"),
+    }
+
+
+def compute_metrics(msgs_all, msgs_content, selected, *, labels, streak_silence_h=24.0):
+    """Compute exactly the selected modules into a dict. Dependencies of the
+    derived `kpis` module (share / response_time / streak) are computed and
+    cached even when not individually selected."""
+    bursts = detect_bursts(msgs_all)
+    all_ns = [m.ns for m in msgs_all]
+    content_ns = [m.ns for m in msgs_content]
+    cache: dict[str, dict] = {}
+
+    def share():
+        return cache.setdefault("message_share", message_share(msgs_content))
+
+    def rt():
+        return cache.setdefault("response_time", response_time(bursts))
+
+    def strk():
+        return cache.setdefault(
+            "streak", streak(msgs_all, silence_h=streak_silence_h)
+        )
+
+    def wh():
+        return cache.setdefault("_wh", weekday_hour_histograms(content_ns))
+
+    out: dict[str, dict] = {}
+    for name in selected:
+        if name == "message_share":
+            out[name] = share()
+        elif name == "response_time":
+            out[name] = rt()
+        elif name == "streak":
+            out[name] = strk()
+        elif name == "kpis":
+            out[name] = compute_kpis(share(), rt(), strk(), labels)
+        elif name == "who_restarts":
+            out[name] = who_restarts(msgs_all)
+        elif name == "texts_before_reply":
+            out[name] = texts_before_reply(bursts)
+        elif name == "monthly_volume":
+            out[name] = monthly_volume(msgs_content)
+        elif name == "weekday":
+            out[name] = wh()[0]
+        elif name == "hour":
+            out[name] = wh()[1]
+        elif name == "top_days":
+            out[name] = {"days": top_days(content_ns)}  # wrapped for a stable object shape
+        elif name == "longest_gap":
+            out[name] = longest_gap(all_ns)
+    return out
+
+
+# --- dashboard CLI support ------------------------------------------- #
+
+def _parse_modules(arg: str | None) -> list[str]:
+    if not arg:
+        return list(MODULES)
+    requested = [m.strip() for m in arg.split(",") if m.strip()]
+    unknown = [m for m in requested if m not in MODULES]
+    if unknown:
+        sys.exit(
+            f"Unknown module(s): {', '.join(unknown)}.\n"
+            f"Available: {', '.join(MODULES)}"
+        )
+    return requested
+
+
+def _other_names(resolver: ContactResolver, other_handles: set[str]) -> set[str]:
+    return {resolver.resolve(0, h) for h in other_handles}
+
+
+def _labels(resolver: ContactResolver, other_handles: set[str]) -> dict:
+    names = _other_names(resolver, other_handles)
+    return {
+        "me": resolver.resolve(1, None),
+        "other": sorted(names)[0] if names else "Them",
+    }
+
+
+def _guard_one_to_one(resolver: ContactResolver, other_handles: set[str], chat_id: int) -> None:
+    """Dashboards are 1:1-only for now. Two handles that resolve to the same
+    name (phone + email of one contact) are treated as one person."""
+    names = _other_names(resolver, other_handles)
+    if len(names) > 1:
+        sys.exit(
+            f"chat_id={chat_id} has {len(names)} other participants "
+            f"({', '.join(sorted(names))}); dashboards are 1:1-only for now.\n"
+            f'Find a 1:1 chat with:  imessage.py chats --participant "<name>"'
+        )
+
+
+# ---------------------------------------------------------------------- #
 # Subcommands                                                            #
 # ---------------------------------------------------------------------- #
 
@@ -630,41 +1043,24 @@ def cmd_stats(args) -> None:
     resolver = ContactResolver(args.contacts)
     since = parse_date(args.since) if args.since else None
     until = parse_date(args.until) if args.until else None
-    where, params = _build_where([args.chat_id], None, since, until)
-    rows = _query_messages(con, where, params)
+    msgs_all, msgs_content, _ = load_metric_messages(
+        con, args.chat_id, since, until
+    )
 
     per_sender: dict[str, dict] = {}
-    all_ns: list[int] = []
-    weekday_counts = [0] * 7
-    hour_counts = [0] * 24
-    day_counts: dict[str, int] = {}
-
-    for row in rows:
-        _, _, ns, is_me, hid, text, att, _ = row
-        content = get_message_text(text, att)
-        if content is None:
-            continue
-        content = content.strip()
-        if not content:
-            continue
-        sender = resolver.resolve(is_me, hid)
+    for m in msgs_content:
+        sender = resolver.resolve(m.is_me, m.hid)
         bucket = per_sender.setdefault(
-            sender, {"count": 0, "lengths": [], "first": ns, "last": ns}
+            sender, {"count": 0, "lengths": [], "first": m.ns, "last": m.ns}
         )
         bucket["count"] += 1
-        bucket["lengths"].append(len(content))
-        if ns < bucket["first"]:
-            bucket["first"] = ns
-        if ns > bucket["last"]:
-            bucket["last"] = ns
-        all_ns.append(ns)
-        dt = to_datetime(ns)
-        if dt:
-            weekday_counts[dt.weekday()] += 1
-            hour_counts[dt.hour] += 1
-            day_key = dt.strftime("%Y-%m-%d")
-            day_counts[day_key] = day_counts.get(day_key, 0) + 1
+        bucket["lengths"].append(m.text_len)
+        if m.ns < bucket["first"]:
+            bucket["first"] = m.ns
+        if m.ns > bucket["last"]:
+            bucket["last"] = m.ns
 
+    content_ns = [m.ns for m in msgs_content]
     total = sum(b["count"] for b in per_sender.values())
     senders_out = []
     for sender, b in sorted(per_sender.items(), key=lambda kv: -kv[1]["count"]):
@@ -681,36 +1077,19 @@ def cmd_stats(args) -> None:
             }
         )
 
-    all_ns.sort()
-    longest_gap_days = 0.0
-    longest_gap_start = None
-    longest_gap_end = None
-    for prev, cur in zip(all_ns, all_ns[1:]):
-        delta = (cur - prev) / 1e9 / 86400  # days
-        if delta > longest_gap_days:
-            longest_gap_days = delta
-            longest_gap_start = prev
-            longest_gap_end = cur
-
-    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    top_days = sorted(day_counts.items(), key=lambda kv: -kv[1])[:5]
-
+    weekday, hour = weekday_hour_histograms(content_ns)
     report = {
         "chat_id": args.chat_id,
         "total_messages": total,
         "range": {
-            "since": fmt_ts(all_ns[0]) if all_ns else None,
-            "until": fmt_ts(all_ns[-1]) if all_ns else None,
+            "since": fmt_ts(content_ns[0]) if content_ns else None,
+            "until": fmt_ts(content_ns[-1]) if content_ns else None,
         },
         "senders": senders_out,
-        "weekday": dict(zip(weekday_labels, weekday_counts)),
-        "hour": {str(h): hour_counts[h] for h in range(24)},
-        "top_days": [{"date": d, "count": c} for d, c in top_days],
-        "longest_gap": {
-            "days": round(longest_gap_days, 2),
-            "from": fmt_ts(longest_gap_start),
-            "to": fmt_ts(longest_gap_end),
-        },
+        "weekday": weekday,
+        "hour": hour,
+        "top_days": top_days(content_ns),
+        "longest_gap": longest_gap(content_ns),
     }
 
     if args.format in ("json", "ndjson"):
@@ -718,7 +1097,7 @@ def cmd_stats(args) -> None:
         return
 
     print(f"chat_id={args.chat_id}  total={total}")
-    if all_ns:
+    if content_ns:
         print(f"range={report['range']['since']} → {report['range']['until']}")
     print()
     print("Senders:")
@@ -730,15 +1109,16 @@ def cmd_stats(args) -> None:
         )
     print()
     print("Weekday histogram:")
-    for label in weekday_labels:
+    weekday_peak = max(report["weekday"].values())
+    for label in WEEKDAY_LABELS:
         n = report["weekday"][label]
-        bar = "█" * max(1, int(40 * n / max(weekday_counts))) if n else ""
+        bar = "█" * max(1, int(40 * n / weekday_peak)) if n else ""
         print(f"  {label}  {n:>6}  {bar}")
     print()
     print("Hour-of-day histogram:")
-    peak = max(hour_counts) if hour_counts else 0
+    peak = max(report["hour"].values())
     for h in range(24):
-        n = hour_counts[h]
+        n = report["hour"][str(h)]
         bar = "█" * max(1, int(40 * n / peak)) if n and peak else ""
         print(f"  {h:02d}  {n:>6}  {bar}")
     print()
@@ -1057,6 +1437,142 @@ def cmd_reactions(args) -> None:
     print(f"--- {len(records)} reactions ---", file=sys.stderr)
 
 
+def _human_secs(secs) -> str:
+    if secs is None:
+        return "—"
+    if secs < 60:
+        return f"{secs:.0f}s"
+    if secs < 3600:
+        return f"{secs / 60:.1f}m"
+    if secs < 86400:
+        return f"{secs / 3600:.1f}h"
+    return f"{secs / 86400:.1f}d"
+
+
+def _metrics_text(out: dict) -> None:
+    m = out["metrics"]
+    L = out["labels"]
+    print(f"chat_id={out['chat_id']}  {L['me']} ⇄ {L['other']}")
+    if out["range"]["since"]:
+        print(f"range={out['range']['since']} → {out['range']['until']}")
+    if "kpis" in m:
+        k = m["kpis"]
+        ratio = f"{k['ratio']:.2f}×" if k.get("ratio") is not None else "—"
+        streak = f"{k.get('streak_days')}d ({'active' if k.get('streak_active') else 'ended'})"
+        print()
+        print(f"volume you/{L['other']}: {ratio}")
+        print(f"{L['other']} reply  median={_human_secs(k.get('median_s'))}  "
+              f"p80={_human_secs(k.get('p80_s'))}")
+        print(f"streak: {streak}")
+    if "message_share" in m:
+        s = m["message_share"]
+        print()
+        print(f"messages: {s['total']}  "
+              f"({L['me']} {s['me']['count']} / {L['other']} {s['other']['count']})")
+    if "response_time" in m:
+        rt = m["response_time"]["other"]["buckets"]
+        print()
+        print(f"{L['other']} response time: "
+              + "  ".join(f"{k}={v}" for k, v in rt.items()))
+    if "who_restarts" in m:
+        wr = m["who_restarts"]
+        print()
+        print("restarts after silence (you/them): "
+              + "  ".join(f"{t} {wr['counts'][t]['me']}/{wr['counts'][t]['other']}"
+                          for t in wr["thresholds"]))
+    if "texts_before_reply" in m:
+        tb = m["texts_before_reply"]["me"]["buckets"]
+        print()
+        print("your texts before a reply: " + "  ".join(f"{k}={v}" for k, v in tb.items()))
+
+
+def cmd_metrics(args) -> None:
+    con = open_db(args.db)
+    resolver = ContactResolver(args.contacts)
+    since = parse_date(args.since) if args.since else None
+    until = parse_date(args.until) if args.until else None
+    selected = _parse_modules(args.modules)
+    msgs_all, msgs_content, other_handles = load_metric_messages(
+        con, args.chat_id, since, until
+    )
+    _guard_one_to_one(resolver, other_handles, args.chat_id)
+    labels = _labels(resolver, other_handles)
+    metrics = compute_metrics(
+        msgs_all, msgs_content, selected,
+        labels=labels, streak_silence_h=args.streak_silence_h,
+    )
+    out = {
+        "chat_id": args.chat_id,
+        "labels": labels,
+        "range": {
+            "since": fmt_ts(msgs_all[0].ns) if msgs_all else None,
+            "until": fmt_ts(msgs_all[-1].ns) if msgs_all else None,
+        },
+        "modules": selected,
+        "metrics": metrics,
+    }
+    if args.format == "ndjson":
+        print(json.dumps(out, ensure_ascii=False))
+    elif args.format == "json":
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        _metrics_text(out)
+
+
+def cmd_dashboard(args) -> None:
+    # `dashboard` is a sibling module. Running this file as a script puts its
+    # own directory on sys.path[0], so a plain import resolves it — no path
+    # munging needed. Lazy so the query subcommands never import the renderer.
+    try:
+        import dashboard
+    except ImportError:
+        sys.exit(
+            "Dashboard renderer not found. Expected scripts/dashboard.py "
+            "next to this script."
+        )
+    con = open_db(args.db)
+    resolver = ContactResolver(args.contacts)
+    since = parse_date(args.since) if args.since else None
+    until = parse_date(args.until) if args.until else None
+    selected = _parse_modules(args.modules)
+    msgs_all, msgs_content, other_handles = load_metric_messages(
+        con, args.chat_id, since, until
+    )
+    if not msgs_all:
+        sys.exit(
+            f"chat_id={args.chat_id} has no messages in range; nothing to render."
+        )
+    _guard_one_to_one(resolver, other_handles, args.chat_id)
+    labels = _labels(resolver, other_handles)
+    metrics = compute_metrics(
+        msgs_all, msgs_content, selected,
+        labels=labels, streak_silence_h=args.streak_silence_h,
+    )
+
+    annotations = None
+    if args.annotations:
+        with open(args.annotations) as f:
+            annotations = json.load(f)
+        schema = annotations.get("schema", "")
+        if schema and not schema.startswith("imessage-dashboard-annotations/"):
+            print(f"warning: unexpected annotations schema {schema!r}",
+                  file=sys.stderr)
+
+    first, last = fmt_ts(msgs_all[0].ns), fmt_ts(msgs_all[-1].ns)
+    subtitle = f"{first[:10]} → {last[:10]}" if first and last else ""
+    title = args.title or f"{labels['me']} ⇄ {labels['other']} — iMessage Dashboard"
+
+    html_doc = dashboard.render_dashboard(
+        metrics, selected, title=title, theme=args.theme,
+        annotations=annotations, labels=labels, subtitle=subtitle,
+    )
+    if args.out:
+        Path(args.out).write_text(html_doc, encoding="utf-8")
+        print(f"--- wrote {args.out} ({len(html_doc)} bytes) ---", file=sys.stderr)
+    else:
+        sys.stdout.write(html_doc)
+
+
 # ---------------------------------------------------------------------- #
 # CLI                                                                    #
 # ---------------------------------------------------------------------- #
@@ -1074,6 +1590,14 @@ def _add_format(parser: argparse.ArgumentParser) -> None:
 def _add_date_range(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--since", help="Start date (YYYY-MM-DD[ HH:MM[:SS]])")
     parser.add_argument("--until", help="End date (exclusive)")
+
+
+def _add_modules(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--modules",
+        help="Comma-separated module names (default: all). Available: "
+             + ", ".join(MODULES),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1231,6 +1755,45 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-len", type=int, default=80)
     _add_format(p)
     p.set_defaults(func=cmd_reactions)
+
+    p = sub.add_parser(
+        "metrics",
+        help="Compute 1:1 conversation metrics (response time, share, "
+             "streaks, …) as JSON",
+    )
+    p.add_argument("chat_id", type=int)
+    _add_modules(p)
+    _add_date_range(p)
+    p.add_argument(
+        "--streak-silence-h", type=float, default=24.0,
+        help="Gap (hours) that breaks a conversational streak (default 24)",
+    )
+    _add_format(p)
+    p.set_defaults(func=cmd_metrics)
+
+    p = sub.add_parser(
+        "dashboard",
+        help="Render a self-contained HTML dashboard for a 1:1 chat",
+    )
+    p.add_argument("chat_id", type=int)
+    _add_modules(p)
+    _add_date_range(p)
+    p.add_argument(
+        "--annotations",
+        help="Path to a narrative annotations JSON (themes, quotes, arc) to "
+             "merge into the dashboard",
+    )
+    p.add_argument("--out", help="Write HTML to this path (default: stdout)")
+    p.add_argument("--title", help="Dashboard title")
+    p.add_argument(
+        "--theme", choices=("light", "dark"), default="light",
+        help="Color theme (default light)",
+    )
+    p.add_argument(
+        "--streak-silence-h", type=float, default=24.0,
+        help="Gap (hours) that breaks a conversational streak (default 24)",
+    )
+    p.set_defaults(func=cmd_dashboard)
 
     return parser
 
